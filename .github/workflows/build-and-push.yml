@@ -1,0 +1,30 @@
+name: Build and Push Radar to Scaleway
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Scaleway Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: rg.fr-par.scw.cloud
+          username: nologin
+          password: ${{ secrets.SCW_SECRET_KEY }}
+
+      - name: Build Docker image
+        run: |
+          docker build -t rg.fr-par.scw.cloud/namespace-loving-archimedes/radar-projets:latest .
+
+      - name: Push Docker image
+        run: |
+          docker push rg.fr-par.scw.cloud/namespace-loving-archimedes/radar-projets:latest
