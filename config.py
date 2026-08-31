@@ -4,7 +4,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv('RADAR_DATA_DIR', BASE_DIR / 'data'))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-MASTER_XLSX = Path(os.getenv('RADAR_MASTER_XLSX', DATA_DIR / 'Radar_Projets_EspaceNova_MASTER.xlsx'))
+MASTER_XLSX = Path(os.getenv('RADAR_MASTER_XLSX', BASE_DIR / 'Radar_Projets_EspaceNova_MASTER.xlsx'))
 DATABASE_URL = os.getenv('DATABASE_URL', f"sqlite:///{DATA_DIR / 'radar.db'}")
 REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', '25'))
 MAX_DOC_BYTES = int(os.getenv('MAX_DOC_BYTES', str(30 * 1024 * 1024)))
