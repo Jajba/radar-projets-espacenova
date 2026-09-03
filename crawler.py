@@ -1,13 +1,14 @@
 import argparse
 import hashlib
 import re
+from difflib import SequenceMatcher
 from urllib.parse import urljoin, urlparse
 
-import requests
-from bs4 import BeautifulSoup
 import fitz
 import pandas as pd
-from sqlalchemy import select, update, insert, and_
+import requests
+from bs4 import BeautifulSoup
+from sqlalchemy import and_, delete, insert, select, update
 
 from config import (
     MASTER_XLSX,
@@ -22,110 +23,141 @@ from detector import evaluate, lead_code
 
 
 LINK_HINTS = [
-    'deliber', 'délibér', 'conseil', 'proces', 'procès', 'pv',
-    'decision', 'décision', 'actes', 'crac', 'rapport',
-    'seance', 'séance', 'compte-rendu', 'compte rendu'
+    "deliber", "délibér", "conseil", "proces", "procès", "pv",
+    "decision", "décision", "actes", "crac", "rapport",
+    "seance", "séance", "compte-rendu", "compte rendu",
 ]
 
 
 def norm_key(value):
-    value = (value or '').lower()
-    value = value.replace('é', 'e').replace('è', 'e').replace('ê', 'e')
-    value = value.replace('à', 'a').replace('â', 'a')
-    value = value.replace('î', 'i').replace('ï', 'i')
-    value = value.replace('ô', 'o')
-    value = value.replace('ù', 'u').replace('û', 'u')
-    value = value.replace('ç', 'c')
-    value = re.sub(r'[^a-z0-9]+', ' ', value)
-    return re.sub(r'\s+', ' ', value).strip()
+    value = (value or "").lower()
+    replacements = {
+        "é": "e", "è": "e", "ê": "e", "ë": "e",
+        "à": "a", "â": "a", "ä": "a",
+        "î": "i", "ï": "i",
+        "ô": "o", "ö": "o",
+        "ù": "u", "û": "u", "ü": "u",
+        "ç": "c",
+    }
+    for src, dst in replacements.items():
+        value = value.replace(src, dst)
+
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
 
 
-def evidence_signature(text):
+def clean_evidence(text):
     """
-    Détecte deux PDF / pages contenant pratiquement le même extrait.
+    Retire une partie du bruit administratif pour comparer deux signaux.
     """
-    cleaned = norm_key(text)[:1800]
-    if not cleaned:
-        return ''
-    return hashlib.sha256(cleaned.encode('utf-8', 'ignore')).hexdigest()
+    t = norm_key(text)
+
+    noise_patterns = [
+        r"\bmme?\b",
+        r"\bmembres?\b",
+        r"\bpresents?\b",
+        r"\babsents?\b",
+        r"\bprocurations?\b",
+        r"\bconseillers?\b",
+        r"\bseance\b",
+        r"\bquorum\b",
+    ]
+
+    for pattern in noise_patterns:
+        t = re.sub(pattern, " ", t)
+
+    return re.sub(r"\s+", " ", t).strip()[:2200]
 
 
-def meaningful_project_key(project):
-    p = norm_key(project)
-    if not p or p == 'non indique':
-        return ''
-    return p
+def text_similarity(a, b):
+    if not a or not b:
+        return 0.0
+
+    return SequenceMatcher(
+        None,
+        clean_evidence(a),
+        clean_evidence(b),
+    ).ratio()
 
 
-def meaningful_company_key(company):
-    c = norm_key(company)
-    if not c or c == 'non indique':
-        return ''
-    return c
+def meaningful(value):
+    value = norm_key(value)
+    if not value or value == "non indique":
+        return ""
+    return value
 
 
 class RadarCrawler:
-    def __init__(self, dry_run=False):
+    def __init__(self, dry_run=False, rebuild_leads=False):
         self.dry_run = dry_run
+        self.rebuild_leads = rebuild_leads
 
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': USER_AGENT,
-            'Accept-Language': 'fr-FR,fr;q=0.9',
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "fr-FR,fr;q=0.9",
         })
 
     def bootstrap_sources(self):
         with engine.begin() as conn:
-            count = conn.execute(
+            exists = conn.execute(
                 select(sources.c.id).limit(1)
             ).first()
 
-            if count:
+            if exists:
                 return
 
-        df = pd.read_excel(MASTER_XLSX, sheet_name='Sources')
+        df = pd.read_excel(
+            MASTER_XLSX,
+            sheet_name="Sources",
+        )
 
         rows = []
 
         for _, r in df.iterrows():
             url = str(
-                r.get('URL_source_principale') or ''
+                r.get("URL_source_principale") or ""
             ).strip()
 
-            if not url or url.lower() == 'nan':
+            if not url or url.lower() == "nan":
                 continue
 
             code = str(
-                r.get('ID_source')
-                or f'SRC-{len(rows) + 1:03d}'
+                r.get("ID_source")
+                or f"SRC-{len(rows) + 1:03d}"
             )
 
             active = (
-                str(r.get('Actif', 'Oui')).strip().lower()
-                not in ('non', 'false', '0')
+                str(r.get("Actif", "Oui"))
+                .strip()
+                .lower()
+                not in ("non", "false", "0")
             )
 
             rows.append({
-                'source_code': code,
-                'name': str(r.get('Nom_source') or code),
-                'structure_type': str(r.get('Type_structure') or ''),
-                'department': str(r.get('Departement') or ''),
-                'url': url,
-                'alt_url': str(r.get('URL_alternative') or ''),
-                'page_type': str(r.get('Type_page') or ''),
-                'prep_status': str(r.get('Statut_preparation') or ''),
-                'audit_priority': str(r.get('Priorite_audit') or ''),
-                'active': active,
-                'notes': str(r.get('Notes') or ''),
-                'radar_family': str(
-                    r.get('Famille_radar')
-                    or 'Foncier public'
+                "source_code": code,
+                "name": str(r.get("Nom_source") or code),
+                "structure_type": str(r.get("Type_structure") or ""),
+                "department": str(r.get("Departement") or ""),
+                "url": url,
+                "alt_url": str(r.get("URL_alternative") or ""),
+                "page_type": str(r.get("Type_page") or ""),
+                "prep_status": str(r.get("Statut_preparation") or ""),
+                "audit_priority": str(r.get("Priorite_audit") or ""),
+                "active": active,
+                "notes": str(r.get("Notes") or ""),
+                "radar_family": str(
+                    r.get("Famille_radar")
+                    or "Foncier public"
                 ),
             })
 
         if not self.dry_run and rows:
             with engine.begin() as conn:
-                conn.execute(insert(sources), rows)
+                conn.execute(
+                    insert(sources),
+                    rows,
+                )
 
     def fetch(self, url):
         r = self.session.get(
@@ -138,51 +170,49 @@ class RadarCrawler:
 
         if len(r.content) > MAX_DOC_BYTES:
             raise ValueError(
-                'Document trop volumineux'
+                "Document trop volumineux"
             )
 
         return r
 
     def discover(self, base_url, response):
         ctype = response.headers.get(
-            'content-type',
-            ''
+            "content-type",
+            "",
         ).lower()
 
         if (
-            'pdf' in ctype
-            or base_url.lower()
-            .split('?')[0]
-            .endswith('.pdf')
+            "pdf" in ctype
+            or base_url.lower().split("?")[0].endswith(".pdf")
         ):
             return [
-                (response.url, 'PDF direct')
+                (response.url, "PDF direct")
             ]
 
         soup = BeautifulSoup(
             response.text,
-            'html.parser'
+            "html.parser",
         )
 
         out = []
         seen = set()
 
-        for a in soup.find_all('a', href=True):
+        for a in soup.find_all("a", href=True):
             href = urljoin(
                 response.url,
-                a['href'].strip()
+                a["href"].strip(),
             )
 
-            text = ' '.join(
+            text = " ".join(
                 a.stripped_strings
             )
 
             blob = (
-                href + ' ' + text
+                href + " " + text
             ).lower()
 
             is_pdf = (
-                '.pdf'
+                ".pdf"
                 in urlparse(href).path.lower()
             )
 
@@ -197,7 +227,7 @@ class RadarCrawler:
             if (
                 relevant
                 and href.startswith(
-                    ('http://', 'https://')
+                    ("http://", "https://")
                 )
                 and href not in seen
             ):
@@ -206,53 +236,44 @@ class RadarCrawler:
                 out.append((
                     href,
                     text[:250]
-                    or href.rsplit('/', 1)[-1],
+                    or href.rsplit("/", 1)[-1],
                 ))
 
             if len(out) >= MAX_LINKS_PER_SOURCE:
                 break
 
-        # On analyse également la page source
-        # car certaines collectivités publient
-        # directement les décisions en HTML.
         out.insert(
             0,
-            (response.url, 'Page source')
+            (response.url, "Page source"),
         )
 
         return out
 
-    def extract_text(
-        self,
-        url,
-        response=None
-    ):
+    def extract_text(self, url, response=None):
         r = response or self.fetch(url)
 
         ctype = r.headers.get(
-            'content-type',
-            ''
+            "content-type",
+            "",
         ).lower()
 
         if (
-            'pdf' in ctype
-            or r.url.lower()
-            .split('?')[0]
-            .endswith('.pdf')
+            "pdf" in ctype
+            or r.url.lower().split("?")[0].endswith(".pdf")
         ):
             doc = fitz.open(
                 stream=r.content,
-                filetype='pdf'
+                filetype="pdf",
             )
 
-            text = '\n'.join(
-                page.get_text('text')
+            text = "\n".join(
+                page.get_text("text")
                 for page in doc
             )
 
             return (
                 text,
-                'application/pdf',
+                "application/pdf",
                 hashlib.sha256(
                     r.content
                 ).hexdigest(),
@@ -260,15 +281,15 @@ class RadarCrawler:
 
         soup = BeautifulSoup(
             r.text,
-            'html.parser'
+            "html.parser",
         )
 
         for tag in soup(
-            ['script', 'style', 'nav', 'footer']
+            ["script", "style", "nav", "footer"]
         ):
             tag.decompose()
 
-        text = '\n'.join(
+        text = "\n".join(
             s.strip()
             for s in soup.stripped_strings
             if s.strip()
@@ -276,7 +297,7 @@ class RadarCrawler:
 
         return (
             text,
-            ctype or 'text/html',
+            ctype or "text/html",
             hashlib.sha256(
                 r.content
             ).hexdigest(),
@@ -291,7 +312,7 @@ class RadarCrawler:
         ctype,
         text_chars,
         ocr_required,
-        status='PROCESSED',
+        status="PROCESSED",
         error=None,
     ):
         now = utcnow()
@@ -302,7 +323,8 @@ class RadarCrawler:
                     and_(
                         documents.c.source_id
                         == source_id,
-                        documents.c.url == url,
+                        documents.c.url
+                        == url,
                     )
                 )
             ).mappings().first()
@@ -310,7 +332,7 @@ class RadarCrawler:
             if row:
                 changed = bool(
                     hsh
-                    and hsh != row['content_hash']
+                    and hsh != row["content_hash"]
                 )
 
                 if not self.dry_run:
@@ -318,30 +340,25 @@ class RadarCrawler:
                         update(documents)
                         .where(
                             documents.c.id
-                            == row['id']
+                            == row["id"]
                         )
                         .values(
                             last_seen_at=now,
                             content_hash=(
                                 hsh
-                                or row['content_hash']
+                                or row["content_hash"]
                             ),
                             content_type=ctype,
                             status=status,
                             text_chars=text_chars,
                             ocr_required=ocr_required,
                             error=error,
-                            processed_at=(
-                                now
-                                if changed
-                                or not row['processed_at']
-                                else row['processed_at']
-                            ),
+                            processed_at=now,
                         )
                     )
 
                 return (
-                    row['id'],
+                    row["id"],
                     changed,
                 )
 
@@ -377,99 +394,92 @@ class RadarCrawler:
         cand,
     ):
         """
-        Deux niveaux de dédoublonnage :
-
-        1. même extrait / même contenu
-        2. même porteur + même projet
-           dans plusieurs PDF de la même source
+        Décide si le candidat correspond déjà
+        à une opportunité existante.
         """
 
-        current_company = (
-            meaningful_company_key(
-                cand.company_sci
-            )
+        company = meaningful(
+            cand.company_sci
         )
 
-        current_project = (
-            meaningful_project_key(
-                cand.project
-            )
+        project = meaningful(
+            cand.project
         )
 
-        current_evidence = (
-            evidence_signature(
-                cand.evidence
-            )
+        signal = meaningful(
+            cand.signal_type
         )
 
-        previous = conn.execute(
+        rows = conn.execute(
             select(
                 leads.c.id,
                 leads.c.company_sci,
                 leads.c.project,
+                leads.c.signal_type,
                 leads.c.evidence_excerpt,
-                leads.c.source_url,
+                leads.c.territory,
             )
             .where(
                 leads.c.source_id
-                == source['id']
+                == source["id"]
             )
             .order_by(
                 leads.c.detected_at.desc()
             )
-            .limit(500)
+            .limit(1000)
         ).mappings()
 
-        for old in previous:
-            old_evidence = (
-                evidence_signature(
-                    old.get(
-                        'evidence_excerpt'
-                    )
-                )
+        for old in rows:
+            old_company = meaningful(
+                old.get("company_sci")
             )
 
-            # Même contenu détecté dans plusieurs URLs/PDF
+            old_project = meaningful(
+                old.get("project")
+            )
+
+            old_signal = meaningful(
+                old.get("signal_type")
+            )
+
+            # Cas fort :
+            # même entreprise + même projet.
             if (
-                current_evidence
-                and old_evidence
-                and current_evidence
-                == old_evidence
-            ):
-                return True
-
-            old_company = (
-                meaningful_company_key(
-                    old.get('company_sci')
-                )
-            )
-
-            old_project = (
-                meaningful_project_key(
-                    old.get('project')
-                )
-            )
-
-            # Même entreprise + même projet
-            if (
-                current_company
+                company
                 and old_company
-                and current_company
-                == old_company
+                and company == old_company
+                and project
+                and old_project
             ):
                 if (
-                    current_project
-                    and old_project
-                    and (
-                        current_project
-                        == old_project
-                        or current_project
-                        in old_project
-                        or old_project
-                        in current_project
-                    )
+                    project == old_project
+                    or project in old_project
+                    or old_project in project
                 ):
                     return True
+
+            # Cas sans société identifiée :
+            # même type de signal + textes très proches.
+            similarity = text_similarity(
+                cand.evidence,
+                old.get("evidence_excerpt"),
+            )
+
+            if similarity >= 0.86:
+                return True
+
+            # Même signal administratif générique :
+            # on exige une ressemblance élevée
+            # pour éviter 20 variantes du même PV.
+            if (
+                not company
+                and not old_company
+                and signal
+                and old_signal
+                and signal == old_signal
+                and similarity >= 0.72
+            ):
+                return True
 
         return False
 
@@ -480,10 +490,21 @@ class RadarCrawler:
         url,
         cand,
     ):
-        # detector.py V2 garantit déjà
-        # un seul lead maximum par URL/document.
+        # Sécurité métier :
+        # jamais de A si entreprise ET projet inconnus.
+        if (
+            cand.score == "A"
+            and meaningful(cand.company_sci) == ""
+            and meaningful(cand.project) == ""
+        ):
+            cand.score = "C"
+            cand.confidence = min(
+                cand.confidence,
+                60,
+            )
+
         code = lead_code(
-            source['id'],
+            source["id"],
             url,
             cand.evidence,
         )
@@ -492,18 +513,16 @@ class RadarCrawler:
             return True
 
         with engine.begin() as conn:
-            # Même document déjà enregistré
             existing = conn.execute(
                 select(leads.c.id).where(
-                    leads.c.lead_code == code
+                    leads.c.lead_code
+                    == code
                 )
             ).first()
 
             if existing:
                 return False
 
-            # Même opportunité déjà détectée
-            # dans un autre PDF de la même structure
             if self.duplicate_opportunity(
                 conn,
                 source,
@@ -514,19 +533,19 @@ class RadarCrawler:
             conn.execute(
                 insert(leads).values(
                     lead_code=code,
-                    source_id=source['id'],
+                    source_id=source["id"],
                     document_id=document_id,
                     detected_at=utcnow(),
                     company_sci=cand.company_sci,
-                    end_user='Non indiqué',
-                    territory=source['name'],
-                    commune='Non indiqué',
-                    zone_site='Non indiqué',
+                    end_user="Non indiqué",
+                    territory=source["name"],
+                    commune="Non indiqué",
+                    zone_site="Non indiqué",
                     signal_family=(
                         source.get(
-                            'radar_family'
+                            "radar_family"
                         )
-                        or 'Foncier public'
+                        or "Foncier public"
                     ),
                     signal_type=cand.signal_type,
                     project=cand.project,
@@ -537,14 +556,13 @@ class RadarCrawler:
                     deductions=cand.deductions,
                     unknowns=cand.unknowns,
                     recommended_action=(
-                        'Lire le résumé et la preuve. '
-                        'Si le signal est confirmé, '
-                        'identifier le décideur / porteur '
-                        'et qualifier le besoin immobilier.'
+                        "Lire la preuve puis qualifier "
+                        "le porteur, le calendrier et "
+                        "le besoin immobilier."
                     ),
                     evidence_excerpt=cand.evidence,
                     source_url=url,
-                    status='Nouveau',
+                    status="Nouveau",
                 )
             )
 
@@ -573,19 +591,19 @@ class RadarCrawler:
 
     def scan_source(self, source):
         stats = {
-            'ok': False,
-            'docs_new': 0,
-            'leads_new': 0,
+            "ok": False,
+            "docs_new": 0,
+            "leads_new": 0,
         }
 
         try:
             first = self.fetch(
-                source['url']
+                source["url"]
             )
 
             links = self.discover(
-                source['url'],
-                first
+                source["url"],
+                first,
             )
 
             for url, title in links:
@@ -602,26 +620,26 @@ class RadarCrawler:
                         hsh,
                     ) = self.extract_text(
                         url,
-                        resp
+                        resp,
                     )
 
                     ocr = (
-                        'pdf' in ctype
+                        "pdf" in ctype
                         and len(text.strip())
                         < MIN_TEXT_CHARS
                     )
 
                     status = (
-                        'OCR_REQUIRED'
+                        "OCR_REQUIRED"
                         if ocr
-                        else 'PROCESSED'
+                        else "PROCESSED"
                     )
 
                     (
                         doc_id,
                         is_new,
                     ) = self.upsert_document(
-                        source['id'],
+                        source["id"],
                         url,
                         title,
                         hsh,
@@ -632,38 +650,44 @@ class RadarCrawler:
                     )
 
                     if is_new:
-                        stats['docs_new'] += 1
+                        stats["docs_new"] += 1
 
                     if ocr:
                         continue
 
-                    # On n'analyse commercialement
-                    # qu'un document nouveau/modifié.
-                    if not is_new:
+                    # En mode normal :
+                    # analyse seulement nouveau/modifié.
+                    #
+                    # En mode rebuild :
+                    # réanalyse TOUS les documents.
+                    if (
+                        not is_new
+                        and not self.rebuild_leads
+                    ):
                         continue
 
                     cand = evaluate(text)
 
-                    if cand:
-                        if self.add_lead(
-                            source,
-                            doc_id,
-                            url,
-                            cand,
-                        ):
-                            stats[
-                                'leads_new'
-                            ] += 1
+                    if not cand:
+                        continue
+
+                    if self.add_lead(
+                        source,
+                        doc_id,
+                        url,
+                        cand,
+                    ):
+                        stats["leads_new"] += 1
 
                 except Exception as e:
                     self.log_error(
-                        source['id'],
+                        source["id"],
                         url,
                         type(e).__name__,
                         e,
                     )
 
-            stats['ok'] = True
+            stats["ok"] = True
 
             if not self.dry_run:
                 with engine.begin() as conn:
@@ -671,7 +695,7 @@ class RadarCrawler:
                         update(sources)
                         .where(
                             sources.c.id
-                            == source['id']
+                            == source["id"]
                         )
                         .values(
                             last_checked_at=utcnow(),
@@ -682,8 +706,8 @@ class RadarCrawler:
 
         except Exception as e:
             self.log_error(
-                source['id'],
-                source['url'],
+                source["id"],
+                source["url"],
                 type(e).__name__,
                 e,
             )
@@ -694,13 +718,13 @@ class RadarCrawler:
                         update(sources)
                         .where(
                             sources.c.id
-                            == source['id']
+                            == source["id"]
                         )
                         .values(
                             last_checked_at=utcnow(),
                             consecutive_errors=(
                                 source.get(
-                                    'consecutive_errors'
+                                    "consecutive_errors"
                                 )
                                 or 0
                             ) + 1,
@@ -709,9 +733,38 @@ class RadarCrawler:
 
         return stats
 
+    def reset_leads(self):
+        """
+        Supprime uniquement les anciennes détections.
+        Les sources, documents et historiques de scans
+        restent intacts.
+        """
+        if self.dry_run:
+            print(
+                "DRY RUN : aucune suppression"
+            )
+            return
+
+        with engine.begin() as conn:
+            count = conn.execute(
+                select(leads.c.id)
+            ).fetchall()
+
+            print(
+                f"Suppression de "
+                f"{len(count)} anciens leads..."
+            )
+
+            conn.execute(
+                delete(leads)
+            )
+
     def run(self, limit=None):
         init_db()
         self.bootstrap_sources()
+
+        if self.rebuild_leads:
+            self.reset_leads()
 
         start = utcnow()
 
@@ -745,38 +798,40 @@ class RadarCrawler:
                 ).inserted_primary_key[0]
 
         total = {
-            'sources_total': len(srcs),
-            'sources_ok': 0,
-            'sources_error': 0,
-            'documents_new': 0,
-            'leads_new': 0,
+            "sources_total": len(srcs),
+            "sources_ok": 0,
+            "sources_error": 0,
+            "documents_new": 0,
+            "leads_new": 0,
         }
 
-        for i, s in enumerate(
+        for i, source in enumerate(
             srcs,
-            1
+            1,
         ):
             print(
-                f'[{i}/{len(srcs)}] '
-                f'{s["name"]}'
+                f"[{i}/{len(srcs)}] "
+                f"{source['name']}"
             )
 
-            st = self.scan_source(s)
-
-            total['sources_ok'] += int(
-                st['ok']
+            st = self.scan_source(
+                source
             )
 
-            total['sources_error'] += int(
-                not st['ok']
+            total["sources_ok"] += int(
+                st["ok"]
             )
 
-            total['documents_new'] += (
-                st['docs_new']
+            total["sources_error"] += int(
+                not st["ok"]
             )
 
-            total['leads_new'] += (
-                st['leads_new']
+            total["documents_new"] += (
+                st["docs_new"]
+            )
+
+            total["leads_new"] += (
+                st["leads_new"]
             )
 
         if (
@@ -801,35 +856,43 @@ class RadarCrawler:
         return total
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     p = argparse.ArgumentParser()
 
     p.add_argument(
-        '--run-once',
-        action='store_true',
-        help='Lance un scan complet une fois',
+        "--run-once",
+        action="store_true",
+        help="Lance un scan une fois",
     )
 
     p.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='Teste sans écrire en base',
+        "--dry-run",
+        action="store_true",
+        help="Teste sans écrire en base",
     )
 
     p.add_argument(
-        '--limit',
+        "--limit",
         type=int,
         default=None,
+        help="Limite le nombre de sources",
+    )
+
+    p.add_argument(
+        "--rebuild-leads",
+        action="store_true",
         help=(
-            'Limite le nombre de sources '
-            'pour un test'
+            "Supprime les anciens leads et "
+            "recalcule toutes les opportunités "
+            "avec les règles V2"
         ),
     )
 
     args = p.parse_args()
 
     RadarCrawler(
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        rebuild_leads=args.rebuild_leads,
     ).run(
         limit=args.limit
     )
